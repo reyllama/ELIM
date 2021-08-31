@@ -2,7 +2,7 @@
 
 Baseline code from [**Image Synthesis From Reconfigurable Layout and Style**](https://arxiv.org/abs/1908.07500) and [**Learning Layout and Style Reconfigurable GANs for Controllable Image Synthesis**](https://arxiv.org/abs/2003.11571)
 
-[Github](https://github.com/iVMCL/LostGANs)
+[[Github]](https://github.com/iVMCL/LostGANs)
 
 ## Reference
 * Synchronized-BatchNorm-PyTorch: [https://github.com/vacancy/Synchronized-BatchNorm-PyTorch](https://github.com/vacancy/Synchronized-BatchNorm-PyTorch)
