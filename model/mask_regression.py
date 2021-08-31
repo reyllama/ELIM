@@ -89,8 +89,8 @@ class MaskRegressNetv2(nn.Module):
         :return: bbmap: (b, num_o, map_size, map_size)
         """
         b, num_o, _ = bbox.size()
-        obj_feat = obj_feat.view(b * num_o, -1)
-        x = self.fc(obj_feat)
+        obj_feat = obj_feat.view(b * num_o, -1) # b*num_o x (128+180)
+        x = self.fc(obj_feat) # (128+180) -> 256x4x4
         x = self.conv1(x.view(b * num_o, 256, 4, 4))
         x = F.interpolate(x, size=8, mode='bilinear')
         x = self.conv2(x)

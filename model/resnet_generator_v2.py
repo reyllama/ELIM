@@ -13,68 +13,76 @@ class ResnetGenerator128(nn.Module):
         super(ResnetGenerator128, self).__init__()
         self.num_classes = num_classes
 
-        self.label_embedding = nn.Embedding(num_classes, 180)
+        self.label_embedding = nn.Embedding(num_classes, 180) # Label Embedding
 
-        num_w = 128+180
+        num_w = 128+180 # z_dim + label_dim
         self.fc = nn.utils.spectral_norm(nn.Linear(z_dim, 4*4*16*ch))
 
-        self.res1 = ResBlock(ch*16, ch*16, upsample=True, num_w=num_w)
-        self.res2 = ResBlock(ch*16, ch*8, upsample=True, num_w=num_w)
-        self.res3 = ResBlock(ch*8, ch*4, upsample=True, num_w=num_w)
-        self.res4 = ResBlock(ch*4, ch*2, upsample=True, num_w=num_w, psp_module=True)
-        self.res5 = ResBlock(ch*2, ch*1, upsample=True, num_w=num_w, predict_mask=False)
+        self.res1 = ResBlock(ch*16, ch*16, upsample=True, num_w=num_w) # 4x4 -> 8x8
+        self.res2 = ResBlock(ch*16, ch*8, upsample=True, num_w=num_w) # 8x8 -> 16x16
+        self.res3 = ResBlock(ch*8, ch*4, upsample=True, num_w=num_w) # 16x16 -> 32x32
+        self.res4 = ResBlock(ch*4, ch*2, upsample=True, num_w=num_w, psp_module=True) # 32x32 -> 64x64
+        self.res5 = ResBlock(ch*2, ch*1, upsample=True, num_w=num_w, predict_mask=False) # 64x64 -> 128x128
         self.final = nn.Sequential(BatchNorm(ch),
                                    nn.ReLU(),
-                                   conv2d(ch, output_dim, 3, 1, 1),
-                                   nn.Tanh())
+                                   conv2d(ch, output_dim, 3, 1, 1), # To RGB (output_dim=3)
+                                   nn.Tanh()) # Align btw [-1, 1]
 
         # mapping function
         mapping = list()
         self.mapping = nn.Sequential(*mapping)
 
-        self.alpha1 = nn.Parameter(torch.zeros(1, 184, 1))
+        self.alpha1 = nn.Parameter(torch.zeros(1, 184, 1)) # Alpha blending / Note that fifth resblock doesn't predict mask
         self.alpha2 = nn.Parameter(torch.zeros(1, 184, 1))
         self.alpha3 = nn.Parameter(torch.zeros(1, 184, 1))
         self.alpha4 = nn.Parameter(torch.zeros(1, 184, 1))
 
         self.sigmoid = nn.Sigmoid()
 
-        self.mask_regress = MaskRegressNetv2(num_w)
+        self.mask_regress = MaskRegressNetv2(num_w) # Initial mask prediction
         self.init_parameter()
 
     def forward(self, z, bbox, z_im=None, y=None):
+
+        """
+        z:      object latent code
+        bbox:   layout bbox
+        z_im:   image latent code
+        y:      categorical label (one-hot)
+        """
+
         b, o = z.size(0), z.size(1)
-        label_embedding = self.label_embedding(y)
+        label_embedding = self.label_embedding(y) # Need to be changed to CLIP word embedding (2-3 words / ex: "white polar bear")
 
         z = z.view(b * o, -1)
         label_embedding = label_embedding.view(b * o, -1)
 
-        latent_vector = torch.cat((z, label_embedding), dim=1).view(b, o, -1)
+        latent_vector = torch.cat((z, label_embedding), dim=1).view(b, o, -1) # b * o * (128+180)
 
         w = self.mapping(latent_vector.view(b * o, -1))
         # preprocess bbox
-        bmask = self.mask_regress(w, bbox)
+        bmask = self.mask_regress(w, bbox) # Initial Mask Prediction
 
-        if z_im is None:
+        if z_im is None: # Generate Image (global) latent code on the fly
             z_im = torch.randn((b, 128), device=z.device)
 
-        bbox_mask_ = bbox_mask(z, bbox, 64, 64)
+        bbox_mask_ = bbox_mask(z, bbox, 64, 64) # Doesn't have anything to do with object latent z (simply employ z.device)
 
         # 4x4
         x = self.fc(z_im).view(b, -1, 4, 4)
         # 8x8
-        x, stage_mask = self.res1(x, w, bmask)
+        x, stage_mask = self.res1(x, w, bmask) # Mask obtained from ResNet Generator (Same Spatial Dimension)
 
         # 16x16
-        hh, ww = x.size(2), x.size(3)
-        seman_bbox = batched_index_select(stage_mask, dim=1, index=y.view(b, o, 1, 1)) # size (b, num_o, h, w)
-        seman_bbox = torch.sigmoid(seman_bbox) * F.interpolate(bbox_mask_, size=(hh, ww), mode='nearest')
+        hh, ww = x.size(2), x.size(3) # 8x8
+        seman_bbox = batched_index_select(stage_mask, dim=1, index=y.view(b, o, 1, 1)) # size (b, num_o, h, w) <- select object mask according to the object label (as index)
+        seman_bbox = torch.sigmoid(seman_bbox) * F.interpolate(bbox_mask_, size=(hh, ww), mode='nearest') # 
         alpha1 = torch.gather(self.sigmoid(self.alpha1).expand(b, -1, -1), dim=1, index=y.view(b, o, 1)).unsqueeze(-1) 
-        stage_bbox = F.interpolate(bmask, size=(hh, ww), mode='bilinear') * (1 - alpha1) + seman_bbox * alpha1
+        stage_bbox = F.interpolate(bmask, size=(hh, ww), mode='bilinear') * (1 - alpha1) + seman_bbox * alpha1 # alpha-blend initial mask prediction with ResBlock mask
         x, stage_mask = self.res2(x, w, stage_bbox)
 
         # 32x32
-        hh, ww = x.size(2), x.size(3)
+        hh, ww = x.size(2), x.size(3) # 16x16
         seman_bbox = batched_index_select(stage_mask, dim=1, index=y.view(b, o, 1, 1)) # size (b, num_o, h, w)
         seman_bbox = torch.sigmoid(seman_bbox) * F.interpolate(bbox_mask_, size=(hh, ww), mode='nearest')
         alpha2 = torch.gather(self.sigmoid(self.alpha2).expand(b, -1, -1), dim=1, index=y.view(b, o, 1)).unsqueeze(-1) 
@@ -82,7 +90,7 @@ class ResnetGenerator128(nn.Module):
         x, stage_mask = self.res3(x, w, stage_bbox)
 
         # 64x64
-        hh, ww = x.size(2), x.size(3)
+        hh, ww = x.size(2), x.size(3) # 32x32
         seman_bbox = batched_index_select(stage_mask, dim=1, index=y.view(b, o, 1, 1)) # size (b, num_o, h, w)
         seman_bbox = torch.sigmoid(seman_bbox) * F.interpolate(bbox_mask_, size=(hh, ww), mode='nearest')
         alpha3 = torch.gather(self.sigmoid(self.alpha3).expand(b, -1, -1), dim=1, index=y.view(b, o, 1)).unsqueeze(-1) 
@@ -90,7 +98,7 @@ class ResnetGenerator128(nn.Module):
         x, stage_mask = self.res4(x, w, stage_bbox)
 
         # 128x128
-        hh, ww = x.size(2), x.size(3)
+        hh, ww = x.size(2), x.size(3) # 64x64
         seman_bbox = batched_index_select(stage_mask, dim=1, index=y.view(b, o, 1, 1)) # size (b, num_o, h, w)
         seman_bbox = torch.sigmoid(seman_bbox) * F.interpolate(bbox_mask_, size=(hh, ww), mode='nearest')
         alpha4 = torch.gather(self.sigmoid(self.alpha4).expand(b, -1, -1), dim=1, index=y.view(b, o, 1)).unsqueeze(-1) 
@@ -301,7 +309,7 @@ def bbox_mask(x, bbox, H, W):
     b, o, _ = bbox.size()
     N = b * o
 
-    bbox_1 = bbox.float().view(-1, 4)
+    bbox_1 = bbox.float().view(-1, 4) # Collapse batch size, n_objs
     x0, y0 = bbox_1[:, 0], bbox_1[:, 1]
     ww, hh = bbox_1[:, 2], bbox_1[:, 3]
 
